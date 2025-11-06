@@ -8,7 +8,7 @@ from PySide6.QtWidgets import (
     QLineEdit, QComboBox, QDateEdit, QMessageBox, QFileDialog,
     QListWidget, QAbstractItemView, QInputDialog, QGroupBox
 )
-from PySide6.QtCore import Qt, QDate
+from PySide6.QtCore import Qt, QDate, QEvent  # ✅ 加上 QEvent
 
 # ---- Matplotlib（嵌入到 Qt） ----
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
@@ -17,6 +17,7 @@ from matplotlib.figure import Figure
 from matplotlib import rcParams
 rcParams['font.sans-serif'] = ['Microsoft YaHei', 'SimHei', 'Noto Sans CJK SC', 'Noto Sans SC', 'Arial Unicode MS']
 rcParams['axes.unicode_minus'] = False  # 解决坐标轴负号显示为方块的问题
+
 # ========================
 # 数据库位置（当前目录 one_account.db）
 # 如需放到 %APPDATA%\OneAccountPC\ 下，可按之前说法替换为固定路径逻辑
@@ -358,11 +359,28 @@ class MainWindow(QMainWindow):
 
         # 表格
         self.table = QTableWidget(0, 6)
-        self.table.setHorizontalHeaderLabels(["ID","类型","分类","金额","日期","备注"])
+        self.table.setHorizontalHeaderLabels(["ID", "类型", "分类", "金额", "日期", "备注"])
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
-        self.table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)   # ✅按行选中
+        self.table.setSelectionMode(QAbstractItemView.SingleSelection)  # ✅单选（更清晰）
         self.table.verticalHeader().setVisible(False)
         self.table.setColumnHidden(0, True)  # 隐藏ID列
+        self.table.setAlternatingRowColors(True)  # ✅斑马纹更易读
+
+        # ✅ 高亮样式（激活/非激活都清晰）
+        self.table.setStyleSheet("""
+        QTableWidget::item:hover {            /* 鼠标悬停提示 */
+            background: #f5faff;
+        }
+        QTableWidget::item:selected:active {
+            background: #cce8ff;             /* 选中且表格在焦点中 */
+            color: #000;
+        }
+        QTableWidget::item:selected:!active {
+            background: #e6f2ff;             /* 选中但表格失去焦点（比如点了按钮） */
+            color: #000;
+        }
+        """)
         v.addWidget(self.table)
 
         # 底部按钮
@@ -406,7 +424,28 @@ class MainWindow(QMainWindow):
         self.btn_export.clicked.connect(self.on_export)
         self.btn_cat_mgr.clicked.connect(self.on_cat_mgr)
 
+        # ✅ 事件过滤器：点击表格外取消选中；点击表格空白也取消
+        self.installEventFilter(self)                 # 监听整个窗口
+        self.table.viewport().installEventFilter(self)  # 监听表格可视区域（空白点击）
+
         self.refresh()
+
+    def eventFilter(self, obj, event):
+        # 点击表格空白 → 取消选中
+        if obj is self.table.viewport() and event.type() == QEvent.MouseButtonPress:
+            index = self.table.indexAt(event.pos())
+            if not index.isValid():
+                self.table.clearSelection()
+                return True  # 事件已处理
+
+        # 点击窗口其它区域（非表格及其子控件）→ 取消选中
+        if obj is self and event.type() == QEvent.MouseButtonPress:
+            # Qt6: event.position() 返回 QPointF
+            w = self.childAt(event.position().toPoint())
+            if w is None or (w is not self.table and not self.table.isAncestorOf(w)):
+                self.table.clearSelection()
+                # 不拦截，让按钮等还能正常接收点击
+        return super().eventFilter(obj, event)
 
     def current_month_str(self):
         d = self.month_edit.date()
@@ -425,6 +464,7 @@ class MainWindow(QMainWindow):
             self.table.setItem(i, 4, QTableWidgetItem(r["date"]))
             self.table.setItem(i, 5, QTableWidgetItem(r["note"] or ""))
         self.table.resizeColumnsToContents()
+        self.table.horizontalHeader().setStretchLastSection(True)
 
         # 顶部统计：今日/本周/本月
         today_cost = sum_today_by_type("expense")
@@ -432,7 +472,6 @@ class MainWindow(QMainWindow):
         week_cost = sum_week_expense(date.today())
         s = sum_month(month)
 
-        # 今日消费颜色：>0 红色，=0 灰色
         self.today_cost_label.setText(f"今日消费 {today_cost:.2f}")
         self.today_cost_label.setStyleSheet("color:#d32f2f;" if today_cost > 0 else "color:#888888;")
         self.today_income_label.setText(f"今日收入 {today_income:.2f}")
@@ -446,8 +485,7 @@ class MainWindow(QMainWindow):
         # 折线图：本月每日消费
         days, totals = daily_expense_for_month(month)
         self.fig_line.clear()
-        self.fig_line.subplots_adjust(bottom=0.18)
-        self.fig_line.subplots_adjust(left=0.15)
+        self.fig_line.subplots_adjust(bottom=0.18, left=0.15)
         ax = self.fig_line.add_subplot(111)
         ax.plot(days, totals, marker='o')
         ax.set_xlabel("日期（日）")
@@ -466,26 +504,13 @@ class MainWindow(QMainWindow):
                 labels=labels,
                 autopct="%1.1f%%",
                 startangle=90,
-                pctdistance=0.75,  # 百分比离中心更远（避免挤在一起）
-                labeldistance=1.1,  # 标签放在扇形外（解决重叠）
+                pctdistance=0.75,   # 百分比离中心更远
+                labeldistance=1.1,  # 标签在扇形外
             )
-
-            # ✅ 自动调整字体大小（避免挤）
             for t in texts + autotexts:
                 t.set_fontsize(9)
-
-            ax2.axis('equal')  # 保持圆形
+            ax2.axis('equal')
             self.fig_pie.tight_layout()
-            # self.canvas_pie.draw()
-            # ax2.pie(
-            #     values,
-            #     labels=labels,
-            #     autopct="%1.1f%%",
-            #     startangle=90,
-            #     pctdistance=0.8,  # 百分比离中心远一点
-            #     labeldistance=1.15,  # 标签放到扇形外面
-            # )
-            # ax2.axis('equal')
         else:
             ax2.text(0.5, 0.5, "本月无消费", ha='center', va='center', fontsize=12)
             ax2.axis('off')
