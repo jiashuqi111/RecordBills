@@ -34,7 +34,7 @@ CREATE TABLE IF NOT EXISTS categories(
 );
 """
 
-DEFAULT_CATEGORIES = ["餐饮","交通","购物","居住","工资","其他"]
+DEFAULT_CATEGORIES = ["餐饮", "交通", "购物", "居住", "工资", "其他"]
 
 # ---------- DB helpers ----------
 def get_conn():
