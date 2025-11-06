@@ -1,18 +1,25 @@
-import os, sys, sqlite3, csv, shutil
+import os, sys, sqlite3, csv, shutil, calendar
 from pathlib import Path
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QPushButton, QTableWidget, QTableWidgetItem, QDialog, QFormLayout,
     QLineEdit, QComboBox, QDateEdit, QMessageBox, QFileDialog,
-    QListWidget, QAbstractItemView, QInputDialog
+    QListWidget, QAbstractItemView, QInputDialog, QGroupBox
 )
 from PySide6.QtCore import Qt, QDate
 
+# ---- Matplotlib（嵌入到 Qt） ----
+from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.figure import Figure
+# ==== Matplotlib 中文显示设置（全局） ====
+from matplotlib import rcParams
+rcParams['font.sans-serif'] = ['Microsoft YaHei', 'SimHei', 'Noto Sans CJK SC', 'Noto Sans SC', 'Arial Unicode MS']
+rcParams['axes.unicode_minus'] = False  # 解决坐标轴负号显示为方块的问题
 # ========================
-# 数据库位置（保持不变：当前目录）
-# 如需固定到 %APPDATA%/OneAccountPC/one_account.db，参见我之前的说明替换 DB_PATH 部分即可
+# 数据库位置（当前目录 one_account.db）
+# 如需放到 %APPDATA%\OneAccountPC\ 下，可按之前说法替换为固定路径逻辑
 # ========================
 DB_PATH = "one_account.db"
 
@@ -27,14 +34,14 @@ CREATE TABLE IF NOT EXISTS transactions(
 );
 CREATE INDEX IF NOT EXISTS idx_t_date ON transactions(date);
 
--- 新增：分类表
+-- 分类表（用于下拉选项）
 CREATE TABLE IF NOT EXISTS categories(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   name TEXT NOT NULL UNIQUE
 );
 """
 
-DEFAULT_CATEGORIES = ["餐饮", "交通", "购物", "居住", "工资", "其他"]
+DEFAULT_CATEGORIES = ["餐饮","交通","购物","居住","工资","其他"]
 
 # ---------- DB helpers ----------
 def get_conn():
@@ -44,12 +51,11 @@ def get_conn():
 
 def init_db():
     with get_conn() as c:
-        # 执行多条 DDL
         for stmt in DDL.strip().split(";"):
             s = stmt.strip()
             if s:
                 c.execute(s)
-        # 若分类表为空，则插入默认分类
+        # 默认分类
         n = c.execute("SELECT COUNT(*) AS n FROM categories").fetchone()["n"]
         if n == 0:
             c.executemany("INSERT INTO categories(name) VALUES(?)",
@@ -78,11 +84,10 @@ def delete_category(name: str):
     if not name:
         return
     with get_conn() as c:
-        # 直接从下拉来源中删除：不会影响已存在的账单记录
         c.execute("DELETE FROM categories WHERE name=?", (name,))
         c.commit()
 
-# ---------- 交易 CRUD ----------
+# ---------- 交易 CRUD & 统计 ----------
 def insert_txn(t):
     with get_conn() as c:
         c.execute("""INSERT INTO transactions(type,category,amount,date,note)
@@ -126,11 +131,74 @@ def sum_month(month):
                             FROM transactions 
                             WHERE date>=? AND date<? 
                             GROUP BY type""", (start, end)).fetchall()
-        r = {"收入": 0.0, "支出": 0.0}
+        r = {"income": 0.0, "expense": 0.0}
         for row in rows:
             r[row["type"]] = float(row["total"] or 0)
-        r["balance"] = r["收入"] - r["支出"]
+        r["balance"] = r["income"] - r["expense"]
         return r
+
+def sum_today_by_type(tp: str) -> float:
+    today = date.today().strftime("%Y-%m-%d")
+    with get_conn() as c:
+        row = c.execute("""
+            SELECT SUM(amount) AS total
+            FROM transactions
+            WHERE type=? AND date=?
+        """, (tp, today)).fetchone()
+        return float(row["total"] or 0.0)
+
+def week_range_of(d: date):
+    # 返回本周的周一和周日（含）  (ISO: Mon=0 .. Sun=6)
+    monday = d - timedelta(days=d.weekday())
+    sunday = monday + timedelta(days=6)
+    return monday, sunday
+
+def sum_week_expense(d: date) -> float:
+    monday, sunday = week_range_of(d)
+    with get_conn() as c:
+        row = c.execute("""
+            SELECT SUM(amount) AS total
+            FROM transactions
+            WHERE type='expense' AND date BETWEEN ? AND ?
+        """, (monday.strftime("%Y-%m-%d"), sunday.strftime("%Y-%m-%d"))).fetchone()
+        return float(row["total"] or 0.0)
+
+def daily_expense_for_month(year_month: str):
+    # 返回 (days[1..last], totals[对应每日消费额])
+    y, m = map(int, year_month.split("-"))
+    last_day = calendar.monthrange(y, m)[1]
+    start = f"{year_month}-01"
+    end = f"{y+1}-01-01" if m == 12 else f"{y}-{m+1:02d}-01"
+    with get_conn() as c:
+        rows = c.execute("""
+            SELECT date, SUM(amount) AS total
+            FROM transactions
+            WHERE type='expense' AND date>=? AND date<?
+            GROUP BY date
+            ORDER BY date
+        """, (start, end)).fetchall()
+    # 填充所有天
+    totals_by_day = {int(r["date"].split("-")[2]): float(r["total"] or 0) for r in rows}
+    days = list(range(1, last_day+1))
+    totals = [totals_by_day.get(d, 0.0) for d in days]
+    return days, totals
+
+def category_expense_share_for_month(year_month: str):
+    y, m = map(int, year_month.split("-"))
+    start = f"{year_month}-01"
+    end = f"{y+1}-01-01" if m == 12 else f"{y}-{m+1:02d}-01"
+    with get_conn() as c:
+        rows = c.execute("""
+            SELECT category, SUM(amount) AS total
+            FROM transactions
+            WHERE type='expense' AND date>=? AND date<?
+            GROUP BY category
+            HAVING total>0
+            ORDER BY total DESC
+        """, (start, end)).fetchall()
+    labels = [r["category"] for r in rows]
+    values = [float(r["total"] or 0) for r in rows]
+    return labels, values
 
 # ---------- UI：分类管理对话框 ----------
 class CategoryManagerDialog(QDialog):
@@ -177,7 +245,6 @@ class CategoryManagerDialog(QDialog):
             QMessageBox.information(self, "提示", "请先选中一条分类")
             return
         name = it.text()
-        # 说明：删除分类只影响“下拉选项”，不会删除账单里已有的文本
         if QMessageBox.question(self, "确认", f"确定删除分类「{name}」？（不会影响历史账单）") == QMessageBox.Yes:
             delete_category(name)
             self.reload()
@@ -191,14 +258,13 @@ class TxnDialog(QDialog):
         form = QFormLayout(self)
 
         self.type_cb = QComboBox()
-        self.type_cb.addItems(["支出","收入"])
+        self.type_cb.addItems(["expense","income"])
         if data: self.type_cb.setCurrentText(data["type"])
         form.addRow("类型", self.type_cb)
 
         self.cat_cb = QComboBox()
         cats = list_categories()
         self.cat_cb.addItems(cats)
-        # 如果是编辑旧账单，且分类已不在列表里，就临时加入，确保能显示/保存
         if data and data["category"] not in cats:
             self.cat_cb.insertItem(0, data["category"])
         if data:
@@ -248,12 +314,12 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("OneAccount (PC)")
-        self.resize(860, 600)
+        self.resize(980, 740)
 
         central = QWidget(); self.setCentralWidget(central)
         v = QVBoxLayout(central)
 
-        # 顶部：月份选择 + 汇总
+        # 顶部：月份选择 + “今日/本周/本月”汇总 + 分类管理
         top = QHBoxLayout()
         self.month_edit = QDateEdit()
         self.month_edit.setDisplayFormat("yyyy-MM")
@@ -262,6 +328,16 @@ class MainWindow(QMainWindow):
         top.addWidget(QLabel("月份："))
         top.addWidget(self.month_edit)
 
+        # 今日消费/收入 + 本月汇总 + 本周消费
+        self.today_cost_label = QLabel("今日消费 0.00")
+        self.today_cost_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+
+        self.today_income_label = QLabel("今日收入 0.00")
+        self.today_income_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+
+        self.week_label = QLabel("本周消费 0.00")
+        self.week_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+
         self.sum_label = QLabel("本月 收入 0.00 | 支出 0.00 | 结余 0.00")
         self.sum_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
 
@@ -269,9 +345,15 @@ class MainWindow(QMainWindow):
         self.btn_cat_mgr = QPushButton("分类管理")
 
         top.addStretch(1)
+        top.addWidget(self.today_cost_label)
+        top.addSpacing(12)
+        top.addWidget(self.today_income_label)
+        top.addSpacing(12)
+        top.addWidget(self.week_label)
+        top.addSpacing(12)
         top.addWidget(self.sum_label)
+        top.addSpacing(12)
         top.addWidget(self.btn_cat_mgr)
-
         v.addLayout(top)
 
         # 表格
@@ -296,6 +378,26 @@ class MainWindow(QMainWindow):
         bottom.addWidget(self.btn_export)
         v.addLayout(bottom)
 
+        # ===== 统计图表区域 =====
+        charts_box = QHBoxLayout()
+        # 左：月度每日消费趋势
+        self.fig_line = Figure(figsize=(5, 3))
+        self.canvas_line = FigureCanvas(self.fig_line)
+        gb1 = QGroupBox("月度每日消费趋势（本月）")
+        gb1_layout = QVBoxLayout(gb1)
+        gb1_layout.addWidget(self.canvas_line)
+
+        # 右：本月分类占比
+        self.fig_pie = Figure(figsize=(5, 3))
+        self.canvas_pie = FigureCanvas(self.fig_pie)
+        gb2 = QGroupBox("分类占比（本月消费）")
+        gb2_layout = QVBoxLayout(gb2)
+        gb2_layout.addWidget(self.canvas_pie)
+
+        charts_box.addWidget(gb1, 1)
+        charts_box.addWidget(gb2, 1)
+        v.addLayout(charts_box)
+
         # 信号
         self.month_edit.dateChanged.connect(self.refresh)
         self.btn_add.clicked.connect(self.on_add)
@@ -311,6 +413,7 @@ class MainWindow(QMainWindow):
         return f"{d.year():04d}-{d.month():02d}"
 
     def refresh(self):
+        # 表格
         month = self.current_month_str()
         rows = list_txns(month)
         self.table.setRowCount(len(rows))
@@ -323,8 +426,70 @@ class MainWindow(QMainWindow):
             self.table.setItem(i, 5, QTableWidgetItem(r["note"] or ""))
         self.table.resizeColumnsToContents()
 
+        # 顶部统计：今日/本周/本月
+        today_cost = sum_today_by_type("expense")
+        today_income = sum_today_by_type("income")
+        week_cost = sum_week_expense(date.today())
         s = sum_month(month)
-        self.sum_label.setText(f'本月 收入 {s["收入"]:.2f} | 支出 {s["支出"]:.2f} | 结余 {s["balance"]:.2f}')
+
+        # 今日消费颜色：>0 红色，=0 灰色
+        self.today_cost_label.setText(f"今日消费 {today_cost:.2f}")
+        self.today_cost_label.setStyleSheet("color:#d32f2f;" if today_cost > 0 else "color:#888888;")
+        self.today_income_label.setText(f"今日收入 {today_income:.2f}")
+        self.week_label.setText(f"本周消费 {week_cost:.2f}")
+        self.sum_label.setText(f'本月 收入 {s["income"]:.2f} | 支出 {s["expense"]:.2f} | 结余 {s["balance"]:.2f}')
+
+        # 图表
+        self.update_charts(month)
+
+    def update_charts(self, month: str):
+        # 折线图：本月每日消费
+        days, totals = daily_expense_for_month(month)
+        self.fig_line.clear()
+        self.fig_line.subplots_adjust(bottom=0.18)
+        self.fig_line.subplots_adjust(left=0.15)
+        ax = self.fig_line.add_subplot(111)
+        ax.plot(days, totals, marker='o')
+        ax.set_xlabel("日期（日）")
+        ax.set_ylabel("消费金额")
+        ax.set_title(f"{month} 每日消费趋势")
+        ax.grid(True, linestyle="--", alpha=0.5)
+        self.canvas_line.draw()
+
+        # 饼图：分类占比（本月消费）
+        labels, values = category_expense_share_for_month(month)
+        self.fig_pie.clear()
+        ax2 = self.fig_pie.add_subplot(111)
+        if values and sum(values) > 0:
+            wedges, texts, autotexts = ax2.pie(
+                values,
+                labels=labels,
+                autopct="%1.1f%%",
+                startangle=90,
+                pctdistance=0.75,  # 百分比离中心更远（避免挤在一起）
+                labeldistance=1.1,  # 标签放在扇形外（解决重叠）
+            )
+
+            # ✅ 自动调整字体大小（避免挤）
+            for t in texts + autotexts:
+                t.set_fontsize(9)
+
+            ax2.axis('equal')  # 保持圆形
+            self.fig_pie.tight_layout()
+            # self.canvas_pie.draw()
+            # ax2.pie(
+            #     values,
+            #     labels=labels,
+            #     autopct="%1.1f%%",
+            #     startangle=90,
+            #     pctdistance=0.8,  # 百分比离中心远一点
+            #     labeldistance=1.15,  # 标签放到扇形外面
+            # )
+            # ax2.axis('equal')
+        else:
+            ax2.text(0.5, 0.5, "本月无消费", ha='center', va='center', fontsize=12)
+            ax2.axis('off')
+        self.canvas_pie.draw()
 
     def selected_id(self):
         idxs = self.table.selectionModel().selectedRows()
@@ -383,7 +548,7 @@ class MainWindow(QMainWindow):
 
     def on_cat_mgr(self):
         dlg = CategoryManagerDialog(self)
-        dlg.exec()  # 关闭即刷新主界面（影响新增/编辑的分类下拉）
+        dlg.exec()
         self.refresh()
 
 # ---------- 入口 ----------
